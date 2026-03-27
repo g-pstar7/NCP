@@ -8,6 +8,7 @@ from telegram import Bot
 from telegram.error import TelegramError
 import numpy as np
 from typing import Tuple, Optional, List
+import config
 
 # Configuration
 class Config:
@@ -16,10 +17,13 @@ class Config:
     ATR_MULTIPLIER_SL = 1.5
     VOLUME_SPIKE_MULTIPLIER = 1.5  # Lowered from 2 for more volume triggers
     STOCHASTIC_PARAMS = {'fastk_period': 7, 'slowk_period': 3, 'slowd_period': 3}  # Kept fast for 5m
-    SYMBOLS = ['NIGHTUSDT', '1000PEPEUSDT', 'FILUSDT', 'FETUSDT', 'WLFIUSDT', 'SIGNUSDT', 'RESOLVUSDT', 'BANANAS31USDT']
     INTERVAL = '5m'
     LIMIT = 500
-    SLEEP_INTERVAL = 180  # 3 minutes
+    SLEEP_INTERVAL = 180   # 3 minutes
+
+    @staticmethod
+    def get_symbols():
+        return config.load_active_pairs()
 
 # Credentials
 CREDENTIALS = {
@@ -281,7 +285,7 @@ async def main():
     logging.info("Starting trading bot (5M timeframe)...")
     while True:
         try:
-            tasks = [analyze_symbol(symbol) for symbol in Config.SYMBOLS]
+            tasks = [analyze_symbol(symbol) for symbol in Config.get_symbols()]
             await asyncio.gather(*tasks)
             logging.info(f"Completed analysis cycle, sleeping for {Config.SLEEP_INTERVAL} seconds")
             await asyncio.sleep(Config.SLEEP_INTERVAL)
