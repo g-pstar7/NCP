@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple, Literal
 
+import config
 import pandas as pd
 import numpy as np
 import talib as ta
@@ -776,47 +777,62 @@ async def fetch_top_pairs() -> List[str]:
     try:
         logging.info("Starting top pairs selection...")
 
-        # ─── Step 1: Get recent high-volume USDT pairs ───────────────────────
-        tickers = client.get_ticker()
+        # ─── Step 1: Get high-volume USDT-M Futures pairs ───────────────────────
+        logging.info("Fetching futures tickers...")
+        tickers = client.futures_ticker()   # Use futures ticker for perpetual contracts
+
         usdt_pairs = [
             t for t in tickers
             if t["symbol"].endswith("USDT")
-            and float(t["quoteVolume"]) > MIN_QUOTE_VOLUME
+            and float(t.get("quoteVolume", 0)) > MIN_QUOTE_VOLUME
             and t["symbol"] not in ["USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT"]
         ]
 
-        usdt_pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-        candidates = [t["symbol"] for t in usdt_pairs[:35]]
+        usdt_pairs.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+        candidates = [t["symbol"] for t in usdt_pairs[:50]]   # Increased to 50 for better selection
 
-        logging.info(f"Initial candidates ({len(candidates)}): {', '.join(candidates[:10])} ...")
+        logging.info(f"Initial futures candidates ({len(candidates)}): {', '.join(candidates[:12])} ...")
 
-        # ─── Step 2: Quick pre-filter ─────────────────────────────────────────
+        # ─── Step 2: Quick pre-filter (liquidity + volatility check) ─────────────
         prefiltered = []
-        for symbol in candidates:
-            df5 = fetch_klines(symbol, "5m", 80)
-            if df5 is None or len(df5) < 50:
+        for i, symbol in enumerate(candidates):
+            try:
+                df5 = fetch_klines(symbol, "5m", 80)
+                if df5 is None or len(df5) < 50:
+                    continue
+
+                df5["ATR"] = ta.ATR(df5["High"], df5["Low"], df5["Close"], timeperiod=14)
+                if pd.isna(df5["ATR"].iloc[-1]) or pd.isna(df5["Close"].iloc[-1]):
+                    continue
+
+                atr_pct = df5["ATR"].iloc[-1] / df5["Close"].iloc[-1]
+                vol_mean = df5["Volume"].mean()
+
+                # Improved filters: decent volume + minimum volatility + avoid too cheap coins
+                if vol_mean < 10_000 or atr_pct < 0.0005 or df5["Close"].iloc[-1] < 0.00001:
+                    continue
+
+                prefiltered.append(symbol)
+
+                # Small delay to respect rate limits
+                if i % 8 == 0 and i > 0:
+                    await asyncio.sleep(0.8)
+
+            except Exception as e:
+                logging.warning(f"Prefilter error for {symbol}: {e}")
                 continue
 
-            df5["ATR"] = ta.ATR(df5["High"], df5["Low"], df5["Close"], timeperiod=14)
-            if pd.isna(df5["ATR"].iloc[-1]):
-                continue
-
-            atr_pct = df5["ATR"].iloc[-1] / df5["Close"].iloc[-1]
-            vol_mean = df5["Volume"].mean()
-
-            if vol_mean < 8_000 or atr_pct < 0.0004:
-                continue
-
-            prefiltered.append(symbol)
-
-        logging.info(f"Prefiltered down to {len(prefiltered)} pairs")
+        logging.info(f"Prefiltered down to {len(prefiltered)} viable pairs")
 
         if not prefiltered:
             logging.warning("No pairs passed pre-filter → using defaults")
-            await send_telegram_message("No pairs passed pre-filter. Using defaults.")
-            return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+            await send_telegram_message("⚠️ No pairs passed pre-filter. Using safe defaults.")
+            default_pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NIGHTUSDT", "1000PEPEUSDT"]
+            config.save_active_pairs(default_pairs)   # Save even on fallback
+            return default_pairs
 
         # ─── Step 3: Backtest all candidates ──────────────────────────────────
+        logging.info(f"Starting backtest on {len(prefiltered)} pairs (this may take a few minutes)...")
         backtest_results = []
         for symbol in prefiltered:
             result = backtest_pair(symbol)
@@ -825,12 +841,13 @@ async def fetch_top_pairs() -> List[str]:
 
         if not backtest_results:
             logging.warning("No valid backtest results → using defaults")
-            await send_telegram_message("Backtesting failed for all. Using defaults.")
-            return ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+            await send_telegram_message("⚠️ Backtesting failed for all candidates. Using defaults.")
+            default_pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NIGHTUSDT", "1000PEPEUSDT"]
+            config.save_active_pairs(default_pairs)
+            return default_pairs
 
-        # ─── Step 4: Group by regime & select top 4 per regime ────────────────
+        # ─── Step 4: Group by regime & select top per regime ───────────────────
         from collections import defaultdict
-
         regime_groups = defaultdict(list)
         for res in backtest_results:
             reg = res.get("regime", "Unknown")
@@ -841,29 +858,28 @@ async def fetch_top_pairs() -> List[str]:
             regime_groups[reg].sort(key=lambda x: x["score"], reverse=True)
 
         # ─── Log grouped top 4 per regime ─────────────────────────────────────
-        logging.info("═" * 60)
+        logging.info("═" * 70)
         logging.info("BACKTEST RESULTS GROUPED BY REGIME (top 4 per group)")
-        logging.info("═" * 60)
+        logging.info("═" * 70)
 
         telegram_lines = ["**Backtest Results by Regime (Top 4 per group)**\n"]
 
         for regime, group in sorted(regime_groups.items()):
             if not group:
                 continue
-
             logging.info(f"Regime: {regime} ({len(group)} pairs)")
             telegram_lines.append(f"**{regime}** ({len(group)} pairs)")
 
             for rank, res in enumerate(group[:4], 1):
                 log_line = (
-                    f"  #{rank} {res['symbol']:10} | Score: {res['score']:6.1f} | "
+                    f"#{rank} {res['symbol']:12} | Score: {res['score']:6.1f} | "
                     f"Trades: {res['trades_count']:3} | WR: {res['win_rate']:5.1%} | "
                     f"PF: {res['profit_factor']:5.2f} | DD: {res['max_drawdown']:5.1%}"
                 )
                 logging.info(log_line)
                 telegram_lines.append(f"{rank}. **{res['symbol']}** (score: {res['score']:.1f})")
 
-            logging.info("")  # empty line between regimes
+            logging.info("")
 
         # ─── Overall top N for watchlist ──────────────────────────────────────
         backtest_results.sort(key=lambda x: x["score"], reverse=True)
@@ -876,21 +892,19 @@ async def fetch_top_pairs() -> List[str]:
 
         await send_telegram_message("\n".join(telegram_lines))
 
-        logging.info(f"Selected watchlist ({len(top_pairs)}): {', '.join(top_pairs)}")
+        logging.info(f"Selected final watchlist ({len(top_pairs)} pairs): {', '.join(top_pairs)}")
+
+        # Save the updated pairs so Ncp1h.py and Ncp5m.py can use them
+        config.save_active_pairs(top_pairs)
 
         return top_pairs
 
     except Exception as e:
-        logging.exception(f"Error in fetch_top_pairs: {e}")
-        await send_telegram_message(f"Error in pair selection: {str(e)}")
-        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-async def send_telegram_message(text: str):
-    try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-        logging.info(f"Telegram sent: {text[:100]}...")
-    except Exception as e:
-        logging.error(f"Telegram failed: {e}")
+        logging.exception(f"Critical error in fetch_top_pairs: {e}")
+        await send_telegram_message(f"❌ Error in pair selection: {str(e)[:200]}")
+        default_pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "NIGHTUSDT"]
+        config.save_active_pairs(default_pairs)
+        return default_pairs
 
 # ────────────────────────────────────────────────
 #   MAIN LOOP
