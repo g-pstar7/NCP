@@ -1,0 +1,6 @@
+python-binance
+python-telegram-bot==20.*
+pandas
+numpy
+TA-Lib
+python-dotenv
